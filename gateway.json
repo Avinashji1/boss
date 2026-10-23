@@ -1,0 +1,17 @@
+{
+  "version": "2026-10-24-01",
+  "updatedAt": "2026-10-24T12:00:00+05:30",
+  "baseURLMap": {
+    "prod": [
+      "https://YOUR-SERVER-URL.com"
+    ]
+  },
+  "usdt": {
+    "trc20": "TY27SXz44BdZbx8FkY82RRSyJYc6fYA9sh",
+    "bep20": "0x7279cCc505ede20330Fe0a70232Ec8Dba23550D0",
+    "trc20Contract": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+    "bep20Contract": "0x55d398326f99059fF775485246999027B3197955"
+  },
+  "usdtRate": 95,
+  "usdtCashback": 0
+}
