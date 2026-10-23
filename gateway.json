@@ -3,7 +3,7 @@
   "updatedAt": "2026-10-24T12:00:00+05:30",
   "baseURLMap": {
     "prod": [
-      "https://raw.githubusercontent.com/Avinashji1/boss/main/gateway.json"
+      "https://boss-y8v9.onrender.com"
     ]
   },
   "usdt": {
