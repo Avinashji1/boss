@@ -1,5 +1,7 @@
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 app.use(express.json());
 
@@ -8,9 +10,34 @@ const BEP20_ADDR = '0x7279cCc505ede20330Fe0a70232Ec8Dba23550D0';
 const USDT_TRC20_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const TRON_API_KEY = process.env.TRON_API_KEY || '';
-const BSC_API_KEY = process.env.BSC_API_KEY || '';
+const BSC_API_KEY  = process.env.BSC_API_KEY  || '';
 
-const orders = {};
+const DATA_DIR = process.env.DATA_DIR;
+if (!DATA_DIR) {
+  throw new Error('Set DATA_DIR to the Render persistent-disk mount path (for example /var/data)');
+}
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+let orders = Object.create(null);
+if (fs.existsSync(ORDERS_FILE)) {
+  const savedOrders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
+  if (!savedOrders || typeof savedOrders !== 'object' || Array.isArray(savedOrders)) {
+    throw new Error(`Invalid persisted orders file: ${ORDERS_FILE}`);
+  }
+  orders = Object.assign(Object.create(null), savedOrders);
+}
+
+function persistOrders() {
+  const tempFile = `${ORDERS_FILE}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(orders), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tempFile, ORDERS_FILE);
+  } catch (error) {
+    error.code = 'ORDER_STORAGE_WRITE_FAILED';
+    throw error;
+  }
+}
 
 async function checkTRC20(expectedAmount) {
   try {
@@ -74,7 +101,8 @@ async function checkBEP20(expectedAmount) {
 }
 
 async function verifyDeposit(chainType, expectedAmount) {
-  if (chainType === 2 || chainType === '2' || chainType === 'BEP20') return await checkBEP20(expectedAmount);
+  if (chainType === 2 || chainType === '2' || chainType === 'BEP20')
+    return await checkBEP20(expectedAmount);
   return await checkTRC20(expectedAmount);
 }
 
@@ -86,12 +114,20 @@ app.post('/app/payment/order/createUsdt', (req, res) => {
   const address = chainType === 2 ? BEP20_ADDR : TRC20_ADDR;
   const order = {
     id: orderId, orderId, orderNo: orderId, buyId: orderId, address,
+    type: chainType, chainType,
     usdtNetwork: chainType === 2 ? 'BEP20' : 'TRC20',
     amount: Number(amount), status: 1,
     createTime: new Date().toISOString(),
     createdAt: new Date().toISOString(), currency: 'USDT'
   };
   orders[orderId] = order;
+  try {
+    persistOrders();
+  } catch (error) {
+    delete orders[orderId];
+    console.error(`[ORDER STORAGE ERROR] ${orderId}: ${error.message}`);
+    return res.status(500).json({ code: 500, msg: 'Could not persist order; try again' });
+  }
   console.log(`[CREATE] ${orderId} | ${amount} USDT | ${order.usdtNetwork}`);
   res.json({ code: 1000, data: order });
 });
@@ -109,9 +145,24 @@ app.get('/app/payment/order/usdtInfo', async (req, res) => {
         order.txId = result.txId;
         order.explorerUrl = result.explorerUrl;
         order.successTime = new Date().toISOString();
+        try {
+          persistOrders();
+        } catch (error) {
+          order.status = 1;
+          delete order.txId;
+          delete order.explorerUrl;
+          delete order.successTime;
+          console.error(`[ORDER STORAGE ERROR] ${buyId}: ${error.message}`);
+          return res.status(500).json({ code: 500, msg: 'Could not persist order status' });
+        }
         console.log(`[APPROVED] ${buyId} | ${result.explorerUrl}`);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`[VERIFY ERROR] ${buyId}: ${e.message}`);
+      if (e.code === 'ORDER_STORAGE_WRITE_FAILED') {
+        return res.status(500).json({ code: 500, msg: 'Could not persist order status' });
+      }
+    }
   }
   res.json({ code: 1000, data: order });
 });
@@ -120,7 +171,6 @@ app.get('/app/payment/order/summary', (req, res) => {
   res.json({ code: 1000, data: { usdtRechargeRate: 95, usdtCashbackRate: 0, balance: 0, reward: 0, pending: 0 } });
 });
 
-// Health check
 app.get('/', (req, res) => res.json({ status: 'ok', server: 'usdt-verify' }));
 
 setInterval(async () => {
@@ -134,9 +184,20 @@ setInterval(async () => {
         order.txId = result.txId;
         order.explorerUrl = result.explorerUrl;
         order.successTime = new Date().toISOString();
+        try {
+          persistOrders();
+        } catch (e) {
+          order.status = 1;
+          delete order.txId;
+          delete order.explorerUrl;
+          delete order.successTime;
+          console.error(`[ORDER STORAGE ERROR] ${order.orderId}: ${e.message}`);
+        }
         console.log(`[AUTO-APPROVED] ${order.orderId}`);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`[AUTO-VERIFY ERROR] ${order.orderId}: ${e.message}`);
+    }
   }
 }, 30000);
 
