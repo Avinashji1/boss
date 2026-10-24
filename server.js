@@ -23,6 +23,9 @@ if (ORDERS_FILE && fs.existsSync(ORDERS_FILE)) {
   }
   orders = Object.assign(Object.create(null), savedOrders);
 }
+const claimedTransactions = new Set(
+  Object.values(orders).map(order => order.txId).filter(Boolean)
+);
 if (!DATA_DIR) {
   console.warn('[ORDER STORAGE] DATA_DIR is unset; orders are memory-only and will be lost on restart.');
 }
@@ -39,7 +42,38 @@ function persistOrders() {
   }
 }
 
-async function checkTRC20(expectedAmount) {
+function normalizeChainType(type) {
+  const value = String(type ?? '').trim().toUpperCase();
+  if (['2', 'BEP20', 'BSC', 'BSC(BEP20)'].includes(value)) return 2;
+  if (['1', 'TRC20', 'TRON', 'TRC'].includes(value)) return 1;
+  return null;
+}
+
+function amountToTokenUnits(amount, decimals) {
+  const value = String(amount);
+  if (!/^\d+(?:\.\d+)?$/.test(value)) return null;
+  const [whole, fraction = ''] = value.split('.');
+  if (fraction.length > decimals) return null;
+  const scale = 10n ** BigInt(decimals);
+  return (BigInt(whole) * scale + BigInt((fraction + '0'.repeat(decimals)).slice(0, decimals))).toString();
+}
+
+function transactionMatchesOrder(tx, order, decimals, timestamp) {
+  const expectedUnits = amountToTokenUnits(order.amount, decimals);
+  const transactionUnits = String(tx.value || '');
+  const createdAt = Date.parse(order.createdAt || order.createTime || '');
+  return Boolean(
+    expectedUnits &&
+    /^\d+$/.test(transactionUnits) &&
+    transactionUnits === expectedUnits &&
+    Number.isFinite(timestamp) &&
+    Number.isFinite(createdAt) &&
+    timestamp >= createdAt &&
+    tx.to
+  );
+}
+
+async function checkTRC20(order) {
   try {
     const headers = {};
     if (TRON_API_KEY) headers['TRON-PRO-API-KEY'] = TRON_API_KEY;
@@ -50,16 +84,24 @@ async function checkTRC20(expectedAmount) {
           only_to: true,
           contract_address: USDT_TRC20_CONTRACT,
           limit: 50,
-          min_timestamp: Date.now() - 24 * 60 * 60 * 1000
+          min_timestamp: Math.max(
+            Date.now() - 24 * 60 * 60 * 1000,
+            Date.parse(order.createdAt || order.createTime)
+          )
         },
         headers, timeout: 10000
       }
     );
     const txs = res.data.data || [];
     for (const tx of txs) {
-      const amount = Number(tx.value) / 1e6;
       const confirmed = tx.ret?.[0]?.contractRet === 'SUCCESS';
-      if (tx.to === TRC20_ADDR && confirmed && Math.abs(amount - expectedAmount) < 0.01) {
+      if (
+        tx.to === TRC20_ADDR &&
+        confirmed &&
+        transactionMatchesOrder(tx, order, 6, Number(tx.block_timestamp)) &&
+        !claimedTransactions.has(tx.transaction_id)
+      ) {
+        const amount = Number(tx.value) / 1e6;
         return {
           matched: true, txId: tx.transaction_id, amount, network: 'TRC20',
           explorerUrl: `https://tronscan.org/#/transaction/${tx.transaction_id}`
@@ -72,22 +114,37 @@ async function checkTRC20(expectedAmount) {
   }
 }
 
-async function checkBEP20(expectedAmount) {
+async function checkBEP20(order) {
   try {
-    const res = await axios.get('https://api.bscscan.com/api', {
+    if (!BSC_API_KEY) {
+      return { matched: false, network: 'BEP20', error: 'BSC_API_KEY is not configured' };
+    }
+    const res = await axios.get('https://api.etherscan.io/v2/api', {
       params: {
+        chainid: 56,
         module: 'account', action: 'tokentx',
         contractaddress: USDT_BEP20_CONTRACT, address: BEP20_ADDR,
         page: 1, offset: 50, sort: 'desc',
-        apikey: BSC_API_KEY || 'YourApiKeyToken'
+        apikey: BSC_API_KEY
       }, timeout: 10000
     });
-    if (res.data.status !== '1') return { matched: false, network: 'BEP20' };
+    if (res.data.status !== '1') {
+      return {
+        matched: false,
+        network: 'BEP20',
+        error: res.data.result || res.data.message || 'BEP20 transfer lookup failed'
+      };
+    }
     const txs = res.data.result || [];
     for (const tx of txs) {
-      const amount = Number(tx.value) / 1e18;
       const confirmed = Number(tx.confirmations) >= 1;
-      if (tx.to.toLowerCase() === BEP20_ADDR.toLowerCase() && confirmed && Math.abs(amount - expectedAmount) < 0.01) {
+      if (
+        String(tx.to || '').toLowerCase() === BEP20_ADDR.toLowerCase() &&
+        confirmed &&
+        transactionMatchesOrder(tx, order, 18, Number(tx.timeStamp) * 1000) &&
+        !claimedTransactions.has(tx.hash)
+      ) {
+        const amount = Number(tx.value) / 1e18;
         return {
           matched: true, txId: tx.hash, amount, network: 'BEP20',
           explorerUrl: `https://bscscan.com/tx/${tx.hash}`
@@ -100,25 +157,71 @@ async function checkBEP20(expectedAmount) {
   }
 }
 
-async function verifyDeposit(chainType, expectedAmount) {
-  if (chainType === 2 || chainType === '2' || chainType === 'BEP20')
-    return await checkBEP20(expectedAmount);
-  return await checkTRC20(expectedAmount);
+async function verifyDeposit(order) {
+  if (order.chainType === 2) return await checkBEP20(order);
+  return await checkTRC20(order);
+}
+
+function approveOrder(order, result) {
+  if (!result.matched || claimedTransactions.has(result.txId)) return false;
+  claimedTransactions.add(result.txId);
+  const previous = {
+    status: order.status,
+    txId: order.txId,
+    explorerUrl: order.explorerUrl,
+    successTime: order.successTime
+  };
+  order.status = 3;
+  order.txId = result.txId;
+  order.explorerUrl = result.explorerUrl;
+  order.successTime = new Date().toISOString();
+  try {
+    persistOrders();
+  } catch (error) {
+    order.status = previous.status;
+    delete order.txId;
+    delete order.explorerUrl;
+    delete order.successTime;
+    if (previous.txId) order.txId = previous.txId;
+    if (previous.explorerUrl) order.explorerUrl = previous.explorerUrl;
+    if (previous.successTime) order.successTime = previous.successTime;
+    claimedTransactions.delete(result.txId);
+    throw error;
+  }
+  return true;
+}
+
+function createOrderCode() {
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+  let code;
+  do {
+    code = Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+  } while (Object.values(orders).some(order => order.orderNo === code));
+  return code;
 }
 
 app.post('/app/payment/order/createUsdt', (req, res) => {
   const { amount, type } = req.body;
-  if (!amount || amount <= 0) return res.json({ code: 400, msg: 'Invalid amount' });
-  const chainType = Number(type) === 2 ? 2 : 1;
-  const orderId = 'U' + Date.now() + Math.floor(Math.random() * 10000);
+  const numericAmount = Number(amount);
+  const chainType = normalizeChainType(type);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0 || !chainType) {
+    return res.json({ code: 400, msg: 'Invalid amount or network' });
+  }
+  if (!amountToTokenUnits(amount, chainType === 2 ? 18 : 6)) {
+    return res.json({ code: 400, msg: 'Amount has too many decimal places for this network' });
+  }
+  let orderId;
+  do {
+    orderId = 'U' + Date.now() + Math.floor(Math.random() * 10000);
+  } while (orders[orderId]);
   const address = chainType === 2 ? BEP20_ADDR : TRC20_ADDR;
+  const createdAt = new Date().toISOString();
   const order = {
-    id: orderId, orderId, orderNo: orderId, buyId: orderId, address,
+    id: orderId, orderId, orderNo: createOrderCode(), buyId: orderId, address,
     type: chainType, chainType,
     usdtNetwork: chainType === 2 ? 'BEP20' : 'TRC20',
-    amount: Number(amount), status: 1,
-    createTime: new Date().toISOString(),
-    createdAt: new Date().toISOString(), currency: 'USDT'
+    amount: numericAmount, status: 1,
+    createTime: createdAt, createdAt, currency: 'USDT'
   };
   orders[orderId] = order;
   try {
@@ -138,23 +241,11 @@ app.get('/app/payment/order/usdtInfo', async (req, res) => {
   if (!order) return res.json({ code: 404, msg: 'Order not found' });
   if (order.status === 1) {
     try {
-      const chainType = order.usdtNetwork === 'BEP20' ? 2 : 1;
-      const result = await verifyDeposit(chainType, order.amount);
-      if (result.matched) {
-        order.status = 3;
-        order.txId = result.txId;
-        order.explorerUrl = result.explorerUrl;
-        order.successTime = new Date().toISOString();
-        try {
-          persistOrders();
-        } catch (error) {
-          order.status = 1;
-          delete order.txId;
-          delete order.explorerUrl;
-          delete order.successTime;
-          console.error(`[ORDER STORAGE ERROR] ${buyId}: ${error.message}`);
-          return res.status(500).json({ code: 500, msg: 'Could not persist order status' });
-        }
+      const result = await verifyDeposit(order);
+      if (result.error) {
+        console.error(`[VERIFY ERROR] ${buyId} (${result.network}): ${result.error}`);
+      }
+      if (approveOrder(order, result)) {
         console.log(`[APPROVED] ${buyId} | ${result.explorerUrl}`);
       }
     } catch (e) {
@@ -177,22 +268,11 @@ setInterval(async () => {
   const pending = Object.values(orders).filter(o => o.status === 1);
   for (const order of pending) {
     try {
-      const chainType = order.usdtNetwork === 'BEP20' ? 2 : 1;
-      const result = await verifyDeposit(chainType, order.amount);
-      if (result.matched) {
-        order.status = 3;
-        order.txId = result.txId;
-        order.explorerUrl = result.explorerUrl;
-        order.successTime = new Date().toISOString();
-        try {
-          persistOrders();
-        } catch (e) {
-          order.status = 1;
-          delete order.txId;
-          delete order.explorerUrl;
-          delete order.successTime;
-          console.error(`[ORDER STORAGE ERROR] ${order.orderId}: ${e.message}`);
-        }
+      const result = await verifyDeposit(order);
+      if (result.error) {
+        console.error(`[AUTO-VERIFY ERROR] ${order.orderId} (${result.network}): ${result.error}`);
+      }
+      if (approveOrder(order, result)) {
         console.log(`[AUTO-APPROVED] ${order.orderId}`);
       }
     } catch (e) {
@@ -206,4 +286,4 @@ app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`   TRC20: ${TRC20_ADDR}`);
   console.log(`   BEP20: ${BEP20_ADDR}`);
-});
+});  
