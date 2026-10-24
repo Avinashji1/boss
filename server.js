@@ -12,23 +12,23 @@ const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const TRON_API_KEY = process.env.TRON_API_KEY || '';
 const BSC_API_KEY  = process.env.BSC_API_KEY  || '';
 
-const DATA_DIR = process.env.DATA_DIR;
-if (!DATA_DIR) {
-  throw new Error('Set DATA_DIR to the Render persistent-disk mount path (for example /var/data)');
-}
-const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
+const DATA_DIR = process.env.DATA_DIR || '';
+const ORDERS_FILE = DATA_DIR ? path.join(DATA_DIR, 'orders.json') : '';
 let orders = Object.create(null);
-if (fs.existsSync(ORDERS_FILE)) {
+if (DATA_DIR) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (ORDERS_FILE && fs.existsSync(ORDERS_FILE)) {
   const savedOrders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
   if (!savedOrders || typeof savedOrders !== 'object' || Array.isArray(savedOrders)) {
     throw new Error(`Invalid persisted orders file: ${ORDERS_FILE}`);
   }
   orders = Object.assign(Object.create(null), savedOrders);
 }
+if (!DATA_DIR) {
+  console.warn('[ORDER STORAGE] DATA_DIR is unset; orders are memory-only and will be lost on restart.');
+}
 
 function persistOrders() {
+  if (!ORDERS_FILE) return;
   const tempFile = `${ORDERS_FILE}.tmp`;
   try {
     fs.writeFileSync(tempFile, JSON.stringify(orders), { encoding: 'utf8', mode: 0o600 });
